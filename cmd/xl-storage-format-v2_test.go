@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -1009,4 +1010,161 @@ func Test_mergeXLV2Versions2(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_mergeEntryChannels(t *testing.T) {
+	dataZ, err := os.ReadFile("testdata/xl-meta-merge.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vers []metaCacheEntry
+	zr, err := zip.NewReader(bytes.NewReader(dataZ), int64(len(dataZ)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, file := range zr.File {
+		if file.UncompressedSize64 == 0 {
+			continue
+		}
+		in, err := file.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer in.Close()
+		buf, err := io.ReadAll(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf = xlMetaV2TrimData(buf)
+
+		vers = append(vers, metaCacheEntry{
+			name:     "a",
+			metadata: buf,
+		})
+	}
+
+	// Shuffle...
+	for i := 0; i < 100; i++ {
+		rng := rand.New(rand.NewSource(int64(i)))
+		rng.Shuffle(len(vers), func(i, j int) {
+			vers[i], vers[j] = vers[j], vers[i]
+		})
+		var entries []chan metaCacheEntry
+		for _, v := range vers {
+			v.cached = nil
+			ch := make(chan metaCacheEntry, 1)
+			ch <- v
+			close(ch)
+			entries = append(entries, ch)
+		}
+		out := make(chan metaCacheEntry, 1)
+		err := mergeEntryChannels(context.Background(), entries, out, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := <-out
+		if !ok {
+			t.Fatal("Got no result")
+		}
+
+		xl, err := got.xlmeta()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(xl.versions) != 3 {
+			t.Fatal("Got wrong number of versions, want 3, got", len(xl.versions))
+		}
+		if !sort.SliceIsSorted(xl.versions, func(i, j int) bool {
+			return xl.versions[i].header.sortsBefore(xl.versions[j].header)
+		}) {
+			t.Errorf("Got unsorted result")
+		}
+	}
+}
+
+func TestXMinIOHealingSkip(t *testing.T) {
+	xl := xlMetaV2{}
+	failOnErr := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("Test failed with %v", err)
+		}
+	}
+
+	fi := FileInfo{
+		Volume:    "volume",
+		Name:      "object-name",
+		VersionID: "756100c6-b393-4981-928a-d49bbc164741",
+		IsLatest:  true,
+		Deleted:   false,
+		ModTime:   time.Now(),
+		Size:      1 << 10,
+		Mode:      0,
+		Erasure: ErasureInfo{
+			Algorithm:    ReedSolomon.String(),
+			DataBlocks:   4,
+			ParityBlocks: 2,
+			BlockSize:    10000,
+			Index:        1,
+			Distribution: []int{1, 2, 3, 4, 5, 6, 7, 8},
+			Checksums: []ChecksumInfo{{
+				PartNumber: 1,
+				Algorithm:  HighwayHash256S,
+				Hash:       nil,
+			}},
+		},
+		NumVersions: 1,
+	}
+
+	fi.SetHealing()
+	failOnErr(xl.AddVersion(fi))
+
+	var err error
+	fi, err = xl.ToFileInfo(fi.Volume, fi.Name, fi.VersionID, false, true)
+	if err != nil {
+		t.Fatalf("xl.ToFileInfo failed with %v", err)
+	}
+
+	if fi.Healing() {
+		t.Fatal("Expected fi.Healing to be false")
+	}
+}
+
+func benchmarkManyPartsOptionally(b *testing.B, allParts bool) {
+	f, err := os.Open("testdata/xl-many-parts.meta")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	buf, _, _ := isIndexedMetaV2(data)
+	if buf == nil {
+		b.Fatal("buf == nil")
+	}
+
+	b.Run("ToFileInfo", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			_, err = buf.ToFileInfo("volume", "path", "", allParts)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkToFileInfoNoParts(b *testing.B) {
+	benchmarkManyPartsOptionally(b, false)
+}
+
+func BenchmarkToFileInfoWithParts(b *testing.B) {
+	benchmarkManyPartsOptionally(b, true)
 }
